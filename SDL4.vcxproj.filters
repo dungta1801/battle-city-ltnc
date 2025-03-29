@@ -1,22 +1,314 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
-<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
-  <ItemGroup>
-    <Filter Include="Source Files">
-      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
-      <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
-    </Filter>
-    <Filter Include="Header Files">
-      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
-      <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
-    </Filter>
-    <Filter Include="Resource Files">
-      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
-      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
-    </Filter>
-  </ItemGroup>
-  <ItemGroup>
-    <ClCompile Include="FileName.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-  </ItemGroup>
-</Project>
+#include <SDL.h>
+#include <SDL_image.h>
+#include <SDL_mixer.h>
+#include <SDL_ttf.h>
+#include <vector>
+#include <iostream>
+#include <cstdlib>
+#include <ctime>
+#include <cmath>
+
+const int SCREEN_WIDTH = 800;
+const int SCREEN_HEIGHT = 600;
+const int UNIT_SIZE = 40;
+const int BULLET_SIZE = 10;
+const int TANK_SPEED = 5;
+const int BULLET_SPEED = 10;
+
+struct Tank {
+    int x, y;
+    int direction; // 0: up, 1: right, 2: down, 3: left
+    bool active;
+    int spawnX, spawnY;
+};
+
+struct Bullet {
+    int x, y;
+    int direction;
+    bool active;
+    bool fromPlayer;
+};
+
+struct Wall {
+    int x, y;
+};
+
+class Game {
+private:
+    SDL_Window* window;
+    SDL_Renderer* renderer;
+    Tank player;
+    std::vector<Tank> enemies;
+    std::vector<Bullet> bullets;
+    std::vector<Wall> walls;
+    bool running;
+    Uint32 lastShotTime;
+
+    // Textures
+    SDL_Texture* playerTexture;
+    SDL_Texture* enemyTexture;
+    SDL_Texture* wallTexture;
+    SDL_Texture* bulletTexture;
+
+    SDL_Texture* loadTexture(const std::string& path) {
+        SDL_Surface* surface = IMG_Load(path.c_str());
+        if (!surface) {
+            std::cerr << "Failed to load " << path << ": " << IMG_GetError() << std::endl;
+            return nullptr;
+        }
+        SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer, surface);
+        SDL_FreeSurface(surface);
+        if (!texture) {
+            std::cerr << "Failed to create texture from " << path << ": " << SDL_GetError() << std::endl;
+        }
+        return texture;
+    }
+
+public:
+    Game() {
+        if (SDL_Init(SDL_INIT_VIDEO) < 0 || IMG_Init(IMG_INIT_PNG) == 0) {
+            std::cerr << "Init failed: " << SDL_GetError() << " | " << IMG_GetError() << std::endl;
+            exit(1);
+        }
+
+        window = SDL_CreateWindow("Battle City", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+            SCREEN_WIDTH, SCREEN_HEIGHT, SDL_WINDOW_SHOWN);
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+        if (!window || !renderer) {
+            std::cerr << "Window/Renderer creation failed" << std::endl;
+            exit(1);
+        }
+
+        // Load textures
+        playerTexture = loadTexture("player_tank.png");
+        enemyTexture = loadTexture("enemy_tank.png");
+        wallTexture = loadTexture("wall.png");
+        bulletTexture = loadTexture("bullet.png");
+        if (!playerTexture || !enemyTexture || !wallTexture || !bulletTexture) {
+            std::cerr << "Texture loading failed" << std::endl;
+            exit(1);
+        }
+
+        player = { 400, 300, 0, true, 400, 300 };
+        walls = {
+            {50, 50}, {50, 90}, {90, 50}, {710, 50}, {710, 90}, {750, 50},
+            {50, 510}, {50, 550}, {90, 550}, {710, 550}, {750, 550}, {750, 510},
+            {370, 50}, {370, 550}, {360, 260}, {360, 300}, {360, 340},
+            {440, 260}, {440, 300}, {440, 340}, {140, 150}, {660, 150},
+            {140, 450}, {660, 450}
+        };
+        srand(static_cast<unsigned>(time(nullptr)));
+        enemies = {
+            {90, 90, 2, true, 90, 90},
+            {710, 90, 2, true, 710, 90},
+            {90, 510, 0, true, 90, 510}
+        };
+        running = true;
+        lastShotTime = 0;
+    }
+
+    ~Game() {
+        SDL_DestroyTexture(playerTexture);
+        SDL_DestroyTexture(enemyTexture);
+        SDL_DestroyTexture(wallTexture);
+        SDL_DestroyTexture(bulletTexture);
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        IMG_Quit();
+        SDL_Quit();
+    }
+
+    bool checkCollision(int x1, int y1, int w1, int h1, int x2, int y2, int w2, int h2) {
+        return (x1 < x2 + w2 && x1 + w1 > x2 && y1 < y2 + h2 && y1 + h1 > y2);
+    }
+
+    bool canMoveTo(const Tank& tank, int newX, int newY) {
+        if (newX < 0 || newX > SCREEN_WIDTH - UNIT_SIZE || newY < 0 || newY > SCREEN_HEIGHT - UNIT_SIZE) return false;
+        for (const auto& wall : walls) {
+            if (checkCollision(newX, newY, UNIT_SIZE, UNIT_SIZE, wall.x, wall.y, UNIT_SIZE, UNIT_SIZE)) return false;
+        }
+        if (&tank == &player) {
+            for (const auto& enemy : enemies) {
+                if (enemy.active && checkCollision(newX, newY, UNIT_SIZE, UNIT_SIZE, enemy.x, enemy.y, UNIT_SIZE, UNIT_SIZE)) return false;
+            }
+        }
+        else {
+            if (player.active && checkCollision(newX, newY, UNIT_SIZE, UNIT_SIZE, player.x, player.y, UNIT_SIZE, UNIT_SIZE)) return false;
+            for (const auto& other : enemies) {
+                if (&other != &tank && other.active && checkCollision(newX, newY, UNIT_SIZE, UNIT_SIZE, other.x, other.y, UNIT_SIZE, UNIT_SIZE)) return false;
+            }
+        }
+        return true;
+    }
+
+    void moveTank(Tank& tank, int dx, int dy) {
+        int newX = tank.x + dx;
+        int newY = tank.y + dy;
+        if (canMoveTo(tank, newX, newY)) {
+            tank.x = newX;
+            tank.y = newY;
+        }
+        if (dy < 0) tank.direction = 0;
+        else if (dy > 0) tank.direction = 2;
+        else if (dx < 0) tank.direction = 3;
+        else if (dx > 0) tank.direction = 1;
+    }
+
+    void respawnTank(Tank& tank) {
+        if (&tank == &player) {
+            running = false;
+            return;
+        }
+        tank.x = tank.spawnX;
+        tank.y = tank.spawnY;
+        tank.direction = rand() % 4;
+        tank.active = true;
+    }
+
+    Bullet spawnBullet(const Tank& tank, bool fromPlayer) {
+        Bullet bullet{ 0, 0, tank.direction, true, fromPlayer };
+        switch (tank.direction) {
+        case 0: bullet.x = tank.x + UNIT_SIZE / 2 - BULLET_SIZE / 2; bullet.y = tank.y - BULLET_SIZE; break;
+        case 1: bullet.x = tank.x + UNIT_SIZE; bullet.y = tank.y + UNIT_SIZE / 2 - BULLET_SIZE / 2; break;
+        case 2: bullet.x = tank.x + UNIT_SIZE / 2 - BULLET_SIZE / 2; bullet.y = tank.y + UNIT_SIZE; break;
+        case 3: bullet.x = tank.x - BULLET_SIZE; bullet.y = tank.y + UNIT_SIZE / 2 - BULLET_SIZE / 2; break;
+        }
+        return bullet;
+    }
+
+    void handleInput() {
+        SDL_Event event;
+        while (SDL_PollEvent(&event)) {
+            if (event.type == SDL_QUIT) running = false;
+        }
+        if (!player.active) return;
+
+        const Uint8* keystates = SDL_GetKeyboardState(NULL);
+        int dx = 0, dy = 0;
+        if (keystates[SDL_SCANCODE_UP]) dy -= TANK_SPEED;
+        if (keystates[SDL_SCANCODE_DOWN]) dy += TANK_SPEED;
+        if (keystates[SDL_SCANCODE_LEFT]) dx -= TANK_SPEED;
+        if (keystates[SDL_SCANCODE_RIGHT]) dx += TANK_SPEED;
+        if (dx != 0 || dy != 0) moveTank(player, dx, dy);
+
+        Uint32 currentTime = SDL_GetTicks();
+        if (keystates[SDL_SCANCODE_SPACE] && (currentTime - lastShotTime > 200)) {
+            bullets.push_back(spawnBullet(player, true));
+            lastShotTime = currentTime;
+        }
+    }
+
+    void update() {
+        for (auto& bullet : bullets) {
+            if (!bullet.active) continue;
+            switch (bullet.direction) {
+            case 0: bullet.y -= BULLET_SPEED; break;
+            case 1: bullet.x += BULLET_SPEED; break;
+            case 2: bullet.y += BULLET_SPEED; break;
+            case 3: bullet.x -= BULLET_SPEED; break;
+            }
+            if (bullet.x < 0 || bullet.x > SCREEN_WIDTH || bullet.y < 0 || bullet.y > SCREEN_HEIGHT) {
+                bullet.active = false;
+                continue;
+            }
+            for (const auto& wall : walls) {
+                if (checkCollision(bullet.x, bullet.y, BULLET_SIZE, BULLET_SIZE, wall.x, wall.y, UNIT_SIZE, UNIT_SIZE)) {
+                    bullet.active = false;
+                    break;
+                }
+            }
+            if (!bullet.active) continue;
+            if (bullet.fromPlayer) {
+                for (auto& enemy : enemies) {
+                    if (enemy.active && checkCollision(bullet.x, bullet.y, BULLET_SIZE, BULLET_SIZE, enemy.x, enemy.y, UNIT_SIZE, UNIT_SIZE)) {
+                        enemy.active = false;
+                        respawnTank(enemy);
+                        bullet.active = false;
+                        break;
+                    }
+                }
+            }
+            else if (player.active && checkCollision(bullet.x, bullet.y, BULLET_SIZE, BULLET_SIZE, player.x, player.y, UNIT_SIZE, UNIT_SIZE)) {
+                player.active = false;
+                respawnTank(player);
+                bullet.active = false;
+            }
+        }
+
+        static Uint32 lastEnemyMove = 0;
+        if (SDL_GetTicks() - lastEnemyMove > 300) {
+            for (auto& enemy : enemies) {
+                if (!enemy.active) continue;
+                int dx = player.x - enemy.x;
+                int dy = player.y - enemy.y;
+                int moveDx = 0, moveDy = 0;
+                if (abs(dx) > abs(dy)) moveDx = (dx > 0) ? TANK_SPEED : -TANK_SPEED;
+                else moveDy = (dy > 0) ? TANK_SPEED : -TANK_SPEED;
+                moveTank(enemy, moveDx, moveDy);
+                if (rand() % 10 < 1) bullets.push_back(spawnBullet(enemy, false));
+            }
+            lastEnemyMove = SDL_GetTicks();
+        }
+    }
+
+    void render() {
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderClear(renderer);
+
+        // Render walls
+        SDL_Rect wallRect{ 0, 0, UNIT_SIZE, UNIT_SIZE };
+        for (const auto& wall : walls) {
+            wallRect.x = wall.x;
+            wallRect.y = wall.y;
+            SDL_RenderCopy(renderer, wallTexture, nullptr, &wallRect);
+        }
+
+        // Render player
+        if (player.active) {
+            SDL_Rect playerRect{ player.x, player.y, UNIT_SIZE, UNIT_SIZE };
+            SDL_RenderCopyEx(renderer, playerTexture, nullptr, &playerRect,
+                player.direction * 90.0, nullptr, SDL_FLIP_NONE);
+        }
+
+        // Render enemies
+        for (const auto& enemy : enemies) {
+            if (enemy.active) {
+                SDL_Rect enemyRect{ enemy.x, enemy.y, UNIT_SIZE, UNIT_SIZE };
+                SDL_RenderCopyEx(renderer, enemyTexture, nullptr, &enemyRect,
+                    enemy.direction * 90.0, nullptr, SDL_FLIP_NONE);
+            }
+        }
+
+        // Render bullets
+        for (const auto& bullet : bullets) {
+            if (bullet.active) {
+                SDL_Rect bulletRect{ bullet.x, bullet.y, BULLET_SIZE, BULLET_SIZE };
+                SDL_RenderCopyEx(renderer, bulletTexture, nullptr, &bulletRect,
+                    bullet.direction * 90.0, nullptr, SDL_FLIP_NONE);
+            }
+        }
+
+        SDL_RenderPresent(renderer);
+    }
+
+    void run() {
+        while (running) {
+            handleInput();
+            update();
+            render();
+            SDL_Delay(16);
+        }
+    }
+};
+
+int main(int argc, char* argv[]) {
+    try {
+        Game game;
+        game.run();
+        return 0;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
+}
